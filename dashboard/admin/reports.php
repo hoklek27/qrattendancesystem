@@ -17,12 +17,24 @@ $stmt = $db->prepare($query);
 $stmt->execute();
 $classes = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
-// Filter parameters
+// Get sessions for selected class
 $selected_class = $_GET['kelas_id'] ?? '';
+$selected_session = $_GET['session_id'] ?? '';
 $selected_month = $_GET['month'] ?? date('Y-m');
 $selected_status = $_GET['status'] ?? '';
 
-// Build query for attendance report
+$sessions = [];
+if ($selected_class) {
+    $session_query = "SELECT qs.*, DATE_FORMAT(qs.tanggal, '%d/%m/%Y') as formatted_date
+                      FROM qr_sessions qs 
+                      WHERE qs.kelas_id = ? 
+                      ORDER BY qs.tanggal DESC, qs.jam_mulai DESC";
+    $session_stmt = $db->prepare($session_query);
+    $session_stmt->execute([$selected_class]);
+    $sessions = $session_stmt->fetchAll(PDO::FETCH_ASSOC);
+}
+
+// Build query conditions
 $where_conditions = ["1=1"];
 $params = [];
 
@@ -31,22 +43,28 @@ if (!empty($selected_class)) {
     $params[] = $selected_class;
 }
 
+if (!empty($selected_session)) {
+    $where_conditions[] = "qs.id = ?";
+    $params[] = $selected_session;
+}
+
 if (!empty($selected_month)) {
     $where_conditions[] = "DATE_FORMAT(qs.tanggal, '%Y-%m') = ?";
     $params[] = $selected_month;
 }
 
 if (!empty($selected_status)) {
-    if ($selected_status === 'hadir') {
-        $where_conditions[] = "a.status = 'hadir'";
-    } elseif ($selected_status === 'tidak_hadir') {
+    if ($selected_status === 'tidak_hadir') {
         $where_conditions[] = "a.id IS NULL";
+    } else {
+        $where_conditions[] = "a.status = ?";
+        $params[] = $selected_status;
     }
 }
 
 $where_clause = implode(' AND ', $where_conditions);
 
-// Get attendance data with evidence
+// Get attendance data with all enrolled students
 $query = "SELECT 
             qs.id as session_id,
             qs.tanggal,
@@ -59,19 +77,20 @@ $query = "SELECT
             u.full_name as dosen_name,
             m.full_name as mahasiswa_name,
             m.nim_nip,
-            a.status,
+            COALESCE(a.status, 'alfa') as status,
             a.scan_time,
-            COUNT(DISTINCT e.mahasiswa_id) as total_mahasiswa,
-            COUNT(DISTINCT CASE WHEN a.status = 'hadir' THEN a.mahasiswa_id END) as hadir_count
+            COUNT(DISTINCT e.mahasiswa_id) OVER (PARTITION BY qs.id) as total_mahasiswa,
+            COUNT(DISTINCT CASE WHEN a.status = 'hadir' THEN a.mahasiswa_id END) OVER (PARTITION BY qs.id) as hadir_count,
+            COUNT(DISTINCT CASE WHEN a.status = 'sakit' THEN a.mahasiswa_id END) OVER (PARTITION BY qs.id) as sakit_count,
+            COUNT(DISTINCT CASE WHEN a.status = 'izin' THEN a.mahasiswa_id END) OVER (PARTITION BY qs.id) as izin_count
           FROM qr_sessions qs
           JOIN kelas k ON qs.kelas_id = k.id
           JOIN mata_kuliah mk ON k.mata_kuliah_id = mk.id
           JOIN users u ON k.dosen_id = u.id
           JOIN enrollments e ON k.id = e.kelas_id
-          LEFT JOIN attendance a ON qs.id = a.qr_session_id AND e.mahasiswa_id = a.mahasiswa_id
-          LEFT JOIN users m ON a.mahasiswa_id = m.id
+          JOIN users m ON e.mahasiswa_id = m.id
+          LEFT JOIN attendance a ON qs.id = a.qr_session_id AND m.id = a.mahasiswa_id
           WHERE $where_clause
-          GROUP BY qs.id, a.id
           ORDER BY qs.tanggal DESC, qs.jam_mulai DESC, mk.kode_mk, m.full_name";
 
 $stmt = $db->prepare($query);
@@ -81,21 +100,207 @@ $attendance_data = $stmt->fetchAll(PDO::FETCH_ASSOC);
 // Get summary statistics
 $summary_query = "SELECT 
                     COUNT(DISTINCT qs.id) as total_sessions,
-                    COUNT(DISTINCT CASE WHEN a.status = 'hadir' THEN a.id END) as total_attendance,
-                    COUNT(DISTINCT e.mahasiswa_id) as total_students,
                     COUNT(DISTINCT k.id) as total_classes,
-                    AVG(CASE WHEN a.status = 'hadir' THEN 1 ELSE 0 END) * 100 as avg_attendance_rate
+                    COUNT(DISTINCT m.id) as total_students,
+                    COUNT(DISTINCT CASE WHEN a.status = 'hadir' THEN a.id END) as total_hadir,
+                    COUNT(DISTINCT CASE WHEN a.status = 'sakit' THEN a.id END) as total_sakit,
+                    COUNT(DISTINCT CASE WHEN a.status = 'izin' THEN a.id END) as total_izin,
+                    COUNT(DISTINCT CASE WHEN a.id IS NULL THEN CONCAT(qs.id, '_', e.mahasiswa_id) END) as total_alfa
                   FROM qr_sessions qs
                   JOIN kelas k ON qs.kelas_id = k.id
+                  JOIN mata_kuliah mk ON k.mata_kuliah_id = mk.id
+                  JOIN users u ON k.dosen_id = u.id
                   JOIN enrollments e ON k.id = e.kelas_id
-                  LEFT JOIN attendance a ON qs.id = a.qr_session_id AND e.mahasiswa_id = a.mahasiswa_id
+                  JOIN users m ON e.mahasiswa_id = m.id
+                  LEFT JOIN attendance a ON qs.id = a.qr_session_id AND m.id = a.mahasiswa_id
                   WHERE $where_clause";
 
-$stmt = $db->prepare($query);
+$stmt = $db->prepare($summary_query);
 $stmt->execute($params);
 $summary = $stmt->fetch(PDO::FETCH_ASSOC);
 
-// Export to CSV
+// Calculate attendance percentage
+$total_possible = ($summary['total_sessions'] ?? 0) * ($summary['total_students'] ?? 0);
+$attendance_percentage = $total_possible > 0 ? 
+    (($summary['total_hadir'] ?? 0) / $total_possible) * 100 : 0;
+
+// Handle PDF Export
+if (isset($_GET['export']) && $_GET['export'] === 'pdf') {
+    require_once '../../vendor/tcpdf/tcpdf.php';
+    
+    $pdf = new TCPDF(PDF_PAGE_ORIENTATION, PDF_UNIT, PDF_PAGE_FORMAT, true, 'UTF-8', false);
+    
+    // Set document information
+    $pdf->SetCreator('QR Attendance System');
+    $pdf->SetAuthor('Administrator');
+    $pdf->SetTitle('Laporan Kehadiran Admin - ' . date('d/m/Y'));
+    
+    // Set margins
+    $pdf->SetMargins(15, 27, 15);
+    $pdf->SetHeaderMargin(5);
+    $pdf->SetFooterMargin(10);
+    
+    // Set auto page breaks
+    $pdf->SetAutoPageBreak(TRUE, 25);
+    
+    // Add a page
+    $pdf->AddPage();
+    
+    // Set font
+    $pdf->SetFont('helvetica', 'B', 16);
+    
+    // Title
+    $pdf->Cell(0, 15, 'LAPORAN KEHADIRAN MAHASISWA', 0, 1, 'C');
+    $pdf->SetFont('helvetica', '', 12);
+    $pdf->Cell(0, 10, 'Politeknik Negeri Samarinda', 0, 1, 'C');
+    $pdf->Cell(0, 10, 'Dashboard Administrator', 0, 1, 'C');
+    $pdf->Ln(10);
+    
+    // Report info
+    $pdf->SetFont('helvetica', 'B', 10);
+    $pdf->Cell(40, 8, 'Periode:', 0, 0, 'L');
+    $pdf->SetFont('helvetica', '', 10);
+    $pdf->Cell(0, 8, date('F Y', strtotime($selected_month . '-01')), 0, 1, 'L');
+    
+    if ($selected_class) {
+        $class_info = array_filter($classes, function($c) use ($selected_class) {
+            return $c['id'] == $selected_class;
+        });
+        if (!empty($class_info)) {
+            $class = reset($class_info);
+            $pdf->SetFont('helvetica', 'B', 10);
+            $pdf->Cell(40, 8, 'Mata Kuliah:', 0, 0, 'L');
+            $pdf->SetFont('helvetica', '', 10);
+            $pdf->Cell(0, 8, $class['kode_mk'] . ' - ' . $class['nama_mk'] . ' (' . $class['nama_kelas'] . ')', 0, 1, 'L');
+            
+            $pdf->SetFont('helvetica', 'B', 10);
+            $pdf->Cell(40, 8, 'Dosen:', 0, 0, 'L');
+            $pdf->SetFont('helvetica', '', 10);
+            $pdf->Cell(0, 8, $class['dosen_name'], 0, 1, 'L');
+        }
+    }
+    
+    $pdf->SetFont('helvetica', 'B', 10);
+    $pdf->Cell(40, 8, 'Tanggal Cetak:', 0, 0, 'L');
+    $pdf->SetFont('helvetica', '', 10);
+    $pdf->Cell(0, 8, date('d/m/Y H:i:s'), 0, 1, 'L');
+    
+    $pdf->Ln(5);
+    
+    // Summary statistics
+    $pdf->SetFont('helvetica', 'B', 12);
+    $pdf->Cell(0, 10, 'RINGKASAN STATISTIK', 0, 1, 'L');
+    
+    $pdf->SetFont('helvetica', '', 10);
+    $pdf->Cell(45, 8, 'Total Sesi:', 1, 0, 'L');
+    $pdf->Cell(25, 8, $summary['total_sessions'] ?? 0, 1, 0, 'C');
+    $pdf->Cell(45, 8, 'Total Kelas:', 1, 0, 'L');
+    $pdf->Cell(25, 8, $summary['total_classes'] ?? 0, 1, 0, 'C');
+    $pdf->Cell(40, 8, '', 0, 1, 'C');
+    
+    $pdf->Cell(45, 8, 'Total Mahasiswa:', 1, 0, 'L');
+    $pdf->Cell(25, 8, $summary['total_students'] ?? 0, 1, 0, 'C');
+    $pdf->Cell(45, 8, 'Persentase Hadir:', 1, 0, 'L');
+    $pdf->Cell(25, 8, number_format($attendance_percentage, 1) . '%', 1, 0, 'C');
+    $pdf->Cell(40, 8, '', 0, 1, 'C');
+    
+    // Status breakdown
+    $pdf->Cell(45, 8, 'Hadir:', 1, 0, 'L');
+    $pdf->Cell(25, 8, $summary['total_hadir'] ?? 0, 1, 0, 'C');
+    $pdf->Cell(45, 8, 'Sakit:', 1, 0, 'L');
+    $pdf->Cell(25, 8, $summary['total_sakit'] ?? 0, 1, 1, 'C');
+    
+    $pdf->Cell(45, 8, 'Izin:', 1, 0, 'L');
+    $pdf->Cell(25, 8, $summary['total_izin'] ?? 0, 1, 0, 'C');
+    $pdf->Cell(45, 8, 'Alfa:', 1, 0, 'L');
+    $pdf->Cell(25, 8, $summary['total_alfa'] ?? 0, 1, 1, 'C');
+    
+    $pdf->Ln(10);
+    
+    // Attendance table
+    if (!empty($attendance_data)) {
+        $pdf->SetFont('helvetica', 'B', 12);
+        $pdf->Cell(0, 10, 'DETAIL KEHADIRAN PER SESI', 0, 1, 'L');
+        
+        // Group by session
+        $sessions_grouped = [];
+        foreach ($attendance_data as $row) {
+            $session_key = $row['session_id'];
+            if (!isset($sessions_grouped[$session_key])) {
+                $sessions_grouped[$session_key] = [
+                    'info' => $row,
+                    'students' => []
+                ];
+            }
+            $sessions_grouped[$session_key]['students'][] = $row;
+        }
+        
+        foreach ($sessions_grouped as $session_data) {
+            $session_info = $session_data['info'];
+            $students = $session_data['students'];
+            
+            // Check if we need a new page
+            if ($pdf->GetY() > 250) {
+                $pdf->AddPage();
+            }
+            
+            // Session header
+            $pdf->SetFont('helvetica', 'B', 11);
+            $pdf->Cell(0, 8, 'Sesi: ' . date('d/m/Y', strtotime($session_info['tanggal'])) . ' - ' . 
+                       $session_info['kode_mk'] . ' (' . $session_info['nama_kelas'] . ') - Dosen: ' . $session_info['dosen_name'], 0, 1, 'L');
+            
+            // Table header
+            $pdf->SetFont('helvetica', 'B', 8);
+            $pdf->Cell(8, 6, 'No', 1, 0, 'C');
+            $pdf->Cell(45, 6, 'Nama Mahasiswa', 1, 0, 'C');
+            $pdf->Cell(20, 6, 'NIM', 1, 0, 'C');
+            $pdf->Cell(15, 6, 'Status', 1, 0, 'C');
+            $pdf->Cell(25, 6, 'Waktu Scan', 1, 1, 'C');
+            
+            // Table data
+            $pdf->SetFont('helvetica', '', 7);
+            $no = 1;
+            $hadir = $sakit = $izin = $alfa = 0;
+            
+            foreach ($students as $student) {
+                // Count status
+                switch ($student['status']) {
+                    case 'hadir': $hadir++; break;
+                    case 'sakit': $sakit++; break;
+                    case 'izin': $izin++; break;
+                    default: $alfa++; break;
+                }
+                
+                $pdf->Cell(8, 5, $no++, 1, 0, 'C');
+                $pdf->Cell(45, 5, $student['mahasiswa_name'], 1, 0, 'L');
+                $pdf->Cell(20, 5, $student['nim_nip'], 1, 0, 'C');
+                $pdf->Cell(15, 5, ucfirst($student['status']), 1, 0, 'C');
+                $pdf->Cell(25, 5, $student['scan_time'] ? date('H:i:s', strtotime($student['scan_time'])) : '-', 1, 1, 'C');
+            }
+            
+            // Session summary
+            $total = count($students);
+            $percentage = $total > 0 ? ($hadir / $total) * 100 : 0;
+            
+            $pdf->SetFont('helvetica', 'B', 8);
+            $pdf->Cell(73, 5, 'RINGKASAN SESI:', 1, 0, 'R');
+            $pdf->Cell(15, 5, 'H:' . $hadir, 1, 0, 'C');
+            $pdf->Cell(25, 5, 'S:' . $sakit . ' I:' . $izin . ' A:' . $alfa, 1, 1, 'C');
+            
+            $pdf->Cell(73, 5, 'PERSENTASE KEHADIRAN:', 1, 0, 'R');
+            $pdf->Cell(40, 5, number_format($percentage, 1) . '% (' . $hadir . '/' . $total . ')', 1, 1, 'C');
+            
+            $pdf->Ln(8);
+        }
+    }
+    
+    // Output PDF
+    $filename = 'Laporan_Kehadiran_Admin_' . date('Y-m-d') . '.pdf';
+    $pdf->Output($filename, 'D');
+    exit;
+}
+
+// Handle CSV Export
 if (isset($_GET['export']) && $_GET['export'] === 'csv') {
     header('Content-Type: text/csv');
     header('Content-Disposition: attachment; filename="laporan_kehadiran_admin_' . date('Y-m-d') . '.csv"');
@@ -126,9 +331,9 @@ if (isset($_GET['export']) && $_GET['export'] === 'csv') {
             $row['nama_mk'],
             $row['nama_kelas'],
             $row['dosen_name'],
-            $row['mahasiswa_name'] ?? 'Tidak Hadir',
-            $row['nim_nip'] ?? '-',
-            $row['status'] ?? 'Tidak Hadir',
+            $row['mahasiswa_name'],
+            $row['nim_nip'],
+            ucfirst($row['status']),
             $row['scan_time'] ? date('H:i:s', strtotime($row['scan_time'])) : '-',
             $row['qr_code']
         ]);
@@ -149,7 +354,7 @@ if (isset($_GET['export']) && $_GET['export'] === 'csv') {
     <style>
         .stats-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
             gap: 20px;
             margin-bottom: 30px;
         }
@@ -158,19 +363,33 @@ if (isset($_GET['export']) && $_GET['export'] === 'csv') {
             background: white;
             padding: 20px;
             border-radius: 8px;
-            border-left: 4px solid #2d5a27;
             box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            text-align: center;
         }
+        
+        .stat-card.hadir { border-left: 4px solid #28a745; }
+        .stat-card.sakit { border-left: 4px solid #ffc107; }
+        .stat-card.izin { border-left: 4px solid #17a2b8; }
+        .stat-card.alfa { border-left: 4px solid #dc3545; }
+        .stat-card.total { border-left: 4px solid #2d5a27; }
+        .stat-card.percentage { border-left: 4px solid #6f42c1; }
         
         .stat-number {
             font-size: 2em;
             font-weight: bold;
-            color: #2d5a27;
+            margin-bottom: 5px;
         }
+        
+        .stat-number.hadir { color: #28a745; }
+        .stat-number.sakit { color: #ffc107; }
+        .stat-number.izin { color: #17a2b8; }
+        .stat-number.alfa { color: #dc3545; }
+        .stat-number.total { color: #2d5a27; }
+        .stat-number.percentage { color: #6f42c1; }
         
         .stat-label {
             color: #666;
-            margin-top: 5px;
+            font-size: 0.9em;
         }
         
         .filter-form {
@@ -182,7 +401,7 @@ if (isset($_GET['export']) && $_GET['export'] === 'csv') {
         
         .filter-row {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
             gap: 15px;
             align-items: end;
         }
@@ -220,7 +439,17 @@ if (isset($_GET['export']) && $_GET['export'] === 'csv') {
             color: #155724;
         }
         
-        .status-tidak-hadir {
+        .status-sakit {
+            background: #fff3cd;
+            color: #856404;
+        }
+        
+        .status-izin {
+            background: #d1ecf1;
+            color: #0c5460;
+        }
+        
+        .status-alfa {
             background: #f8d7da;
             color: #721c24;
         }
@@ -230,57 +459,20 @@ if (isset($_GET['export']) && $_GET['export'] === 'csv') {
             font-weight: bold;
         }
         
-        .evidence-btn {
-            padding: 4px 8px;
-            font-size: 0.8em;
-            border: none;
-            border-radius: 4px;
-            cursor: pointer;
-            background: #007bff;
-            color: white;
-        }
-        
-        .evidence-btn:hover {
-            background: #0056b3;
-        }
-        
-        .modal {
-            display: none;
-            position: fixed;
-            z-index: 1000;
-            left: 0;
-            top: 0;
-            width: 100%;
-            height: 100%;
-            background-color: rgba(0,0,0,0.5);
-        }
-        
-        .modal-content {
-            background-color: white;
-            margin: 5% auto;
-            padding: 20px;
-            border-radius: 8px;
-            width: 90%;
-            max-width: 600px;
-            max-height: 80vh;
-            overflow-y: auto;
-        }
-        
-        .close {
-            color: #aaa;
-            float: right;
-            font-size: 28px;
-            font-weight: bold;
-            cursor: pointer;
-        }
-        
-        .close:hover {
-            color: black;
+        .export-buttons {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
         }
         
         @media (max-width: 768px) {
             .filter-row {
                 grid-template-columns: 1fr;
+            }
+            
+            .stats-grid {
+                grid-template-columns: repeat(2, 1fr);
             }
             
             .attendance-table {
@@ -290,6 +482,10 @@ if (isset($_GET['export']) && $_GET['export'] === 'csv') {
             .attendance-table th,
             .attendance-table td {
                 padding: 6px 4px;
+            }
+            
+            .export-buttons {
+                flex-direction: column;
             }
         }
     </style>
@@ -313,25 +509,29 @@ if (isset($_GET['export']) && $_GET['export'] === 'csv') {
             <div class="container">
                 <!-- Statistics -->
                 <div class="stats-grid">
-                    <div class="stat-card">
-                        <div class="stat-number"><?php echo $summary['total_sessions'] ?? 0; ?></div>
+                    <div class="stat-card total">
+                        <div class="stat-number total"><?php echo $summary['total_sessions'] ?? 0; ?></div>
                         <div class="stat-label">Total Sesi</div>
                     </div>
-                    <div class="stat-card">
-                        <div class="stat-number"><?php echo $summary['total_attendance'] ?? 0; ?></div>
-                        <div class="stat-label">Total Kehadiran</div>
+                    <div class="stat-card hadir">
+                        <div class="stat-number hadir"><?php echo $summary['total_hadir'] ?? 0; ?></div>
+                        <div class="stat-label">Hadir</div>
                     </div>
-                    <div class="stat-card">
-                        <div class="stat-number"><?php echo $summary['total_students'] ?? 0; ?></div>
-                        <div class="stat-label">Total Mahasiswa</div>
+                    <div class="stat-card sakit">
+                        <div class="stat-number sakit"><?php echo $summary['total_sakit'] ?? 0; ?></div>
+                        <div class="stat-label">Sakit</div>
                     </div>
-                    <div class="stat-card">
-                        <div class="stat-number"><?php echo $summary['total_classes'] ?? 0; ?></div>
-                        <div class="stat-label">Total Kelas</div>
+                    <div class="stat-card izin">
+                        <div class="stat-number izin"><?php echo $summary['total_izin'] ?? 0; ?></div>
+                        <div class="stat-label">Izin</div>
                     </div>
-                    <div class="stat-card">
-                        <div class="stat-number"><?php echo number_format($summary['avg_attendance_rate'] ?? 0, 1); ?>%</div>
-                        <div class="stat-label">Rata-rata Kehadiran</div>
+                    <div class="stat-card alfa">
+                        <div class="stat-number alfa"><?php echo $summary['total_alfa'] ?? 0; ?></div>
+                        <div class="stat-label">Alfa</div>
+                    </div>
+                    <div class="stat-card percentage">
+                        <div class="stat-number percentage"><?php echo number_format($attendance_percentage, 1); ?>%</div>
+                        <div class="stat-label">Persentase Kehadiran</div>
                     </div>
                 </div>
                 
@@ -345,11 +545,23 @@ if (isset($_GET['export']) && $_GET['export'] === 'csv') {
                             <div class="filter-row">
                                 <div class="form-group">
                                     <label for="kelas_id">Kelas</label>
-                                    <select id="kelas_id" name="kelas_id" class="form-control">
+                                    <select id="kelas_id" name="kelas_id" class="form-control" onchange="loadSessions()">
                                         <option value="">Semua Kelas</option>
                                         <?php foreach ($classes as $class): ?>
                                             <option value="<?php echo $class['id']; ?>" <?php echo $selected_class == $class['id'] ? 'selected' : ''; ?>>
                                                 <?php echo $class['kode_mk'] . ' - ' . $class['nama_mk'] . ' (' . $class['nama_kelas'] . ') - ' . $class['dosen_name']; ?>
+                                            </option>
+                                        <?php endforeach; ?>
+                                    </select>
+                                </div>
+                                
+                                <div class="form-group">
+                                    <label for="session_id">Sesi Perkuliahan</label>
+                                    <select id="session_id" name="session_id" class="form-control">
+                                        <option value="">Semua Sesi</option>
+                                        <?php foreach ($sessions as $session): ?>
+                                            <option value="<?php echo $session['id']; ?>" <?php echo $selected_session == $session['id'] ? 'selected' : ''; ?>>
+                                                <?php echo $session['formatted_date'] . ' (' . $session['jam_mulai'] . ' - ' . $session['jam_selesai'] . ')'; ?>
                                             </option>
                                         <?php endforeach; ?>
                                     </select>
@@ -365,6 +577,9 @@ if (isset($_GET['export']) && $_GET['export'] === 'csv') {
                                     <select id="status" name="status" class="form-control">
                                         <option value="">Semua Status</option>
                                         <option value="hadir" <?php echo $selected_status === 'hadir' ? 'selected' : ''; ?>>Hadir</option>
+                                        <option value="sakit" <?php echo $selected_status === 'sakit' ? 'selected' : ''; ?>>Sakit</option>
+                                        <option value="izin" <?php echo $selected_status === 'izin' ? 'selected' : ''; ?>>Izin</option>
+                                        <option value="alfa" <?php echo $selected_status === 'alfa' ? 'selected' : ''; ?>>Alfa</option>
                                         <option value="tidak_hadir" <?php echo $selected_status === 'tidak_hadir' ? 'selected' : ''; ?>>Tidak Hadir</option>
                                     </select>
                                 </div>
@@ -378,15 +593,20 @@ if (isset($_GET['export']) && $_GET['export'] === 'csv') {
                     </div>
                 </div>
                 
+                <!-- Export Buttons -->
+                <div class="export-buttons">
+                    <a href="?<?php echo http_build_query(array_merge($_GET, ['export' => 'pdf'])); ?>" class="btn btn-danger">
+                        📄 Export PDF
+                    </a>
+                    <a href="?<?php echo http_build_query(array_merge($_GET, ['export' => 'csv'])); ?>" class="btn btn-success">
+                        📊 Export CSV
+                    </a>
+                </div>
+                
                 <!-- Report Table -->
                 <div class="card">
                     <div class="card-header">
                         <h3 class="card-title">Data Kehadiran</h3>
-                        <div style="margin-left: auto;">
-                            <a href="?<?php echo http_build_query(array_merge($_GET, ['export' => 'csv'])); ?>" class="btn btn-success">
-                                📊 Export CSV
-                            </a>
-                        </div>
                     </div>
                     <div class="card-body">
                         <?php if (empty($attendance_data)): ?>
@@ -407,7 +627,6 @@ if (isset($_GET['export']) && $_GET['export'] === 'csv') {
                                             <th>NIM</th>
                                             <th>Status</th>
                                             <th>Waktu Scan</th>
-                                            <th>Bukti</th>
                                         </tr>
                                     </thead>
                                     <tbody>
@@ -417,12 +636,25 @@ if (isset($_GET['export']) && $_GET['export'] === 'csv') {
                                             $session_key = $row['session_id'] . '_' . $row['tanggal'];
                                             if ($current_session !== $session_key):
                                                 $current_session = $session_key;
+                                                
+                                                // Calculate session statistics
+                                                $session_students = array_filter($attendance_data, function($item) use ($row) {
+                                                    return $item['session_id'] === $row['session_id'];
+                                                });
+                                                
+                                                $session_hadir = count(array_filter($session_students, function($s) { return $s['status'] === 'hadir'; }));
+                                                $session_sakit = count(array_filter($session_students, function($s) { return $s['status'] === 'sakit'; }));
+                                                $session_izin = count(array_filter($session_students, function($s) { return $s['status'] === 'izin'; }));
+                                                $session_alfa = count(array_filter($session_students, function($s) { return $s['status'] === 'alfa'; }));
+                                                $session_total = count($session_students);
+                                                $session_percentage = $session_total > 0 ? ($session_hadir / $session_total) * 100 : 0;
                                         ?>
                                                 <tr class="session-group">
-                                                    <td colspan="10">
+                                                    <td colspan="9">
                                                         <strong>Sesi: <?php echo date('d/m/Y', strtotime($row['tanggal'])); ?> - 
-                                                        <?php echo $row['kode_mk']; ?> (<?php echo $row['nama_kelas']; ?>)</strong>
-                                                        - Hadir: <?php echo $row['hadir_count']; ?>/<?php echo $row['total_mahasiswa']; ?>
+                                                        <?php echo $row['kode_mk']; ?> (<?php echo $row['nama_kelas']; ?>) - <?php echo $row['dosen_name']; ?></strong>
+                                                        - H:<?php echo $session_hadir; ?> S:<?php echo $session_sakit; ?> I:<?php echo $session_izin; ?> A:<?php echo $session_alfa; ?> 
+                                                        (<?php echo number_format($session_percentage, 1); ?>%)
                                                     </td>
                                                 </tr>
                                         <?php endif; ?>
@@ -433,23 +665,14 @@ if (isset($_GET['export']) && $_GET['export'] === 'csv') {
                                             <td><?php echo $row['kode_mk'] . ' - ' . $row['nama_mk']; ?></td>
                                             <td><?php echo $row['nama_kelas']; ?></td>
                                             <td><?php echo $row['dosen_name']; ?></td>
-                                            <td><?php echo $row['mahasiswa_name'] ?? 'Tidak Hadir'; ?></td>
-                                            <td><?php echo $row['nim_nip'] ?? '-'; ?></td>
+                                            <td><?php echo $row['mahasiswa_name']; ?></td>
+                                            <td><?php echo $row['nim_nip']; ?></td>
                                             <td>
-                                                <span class="status-badge status-<?php echo $row['status'] ? 'hadir' : 'tidak-hadir'; ?>">
-                                                    <?php echo $row['status'] ? ucfirst($row['status']) : 'Tidak Hadir'; ?>
+                                                <span class="status-badge status-<?php echo $row['status']; ?>">
+                                                    <?php echo ucfirst($row['status']); ?>
                                                 </span>
                                             </td>
                                             <td><?php echo $row['scan_time'] ? date('H:i:s', strtotime($row['scan_time'])) : '-'; ?></td>
-                                            <td>
-                                                <?php if ($row['status']): ?>
-                                                    <button class="evidence-btn" onclick="showEvidence('<?php echo $row['qr_code']; ?>', '<?php echo $row['mahasiswa_name']; ?>', '<?php echo $row['scan_time']; ?>')">
-                                                        📋 Bukti
-                                                    </button>
-                                                <?php else: ?>
-                                                    -
-                                                <?php endif; ?>
-                                            </td>
                                         </tr>
                                         <?php endforeach; ?>
                                     </tbody>
@@ -462,45 +685,28 @@ if (isset($_GET['export']) && $_GET['export'] === 'csv') {
         </div>
     </div>
 
-    <!-- Evidence Modal -->
-    <div id="evidenceModal" class="modal">
-        <div class="modal-content">
-            <span class="close" onclick="closeEvidenceModal()">&times;</span>
-            <h3>Bukti Kehadiran</h3>
-            <div id="evidenceContent"></div>
-        </div>
-    </div>
-
     <script>
-        function showEvidence(qrCode, studentName, scanTime) {
-            const content = `
-                <div style="padding: 20px;">
-                    <h4>Detail Kehadiran</h4>
-                    <p><strong>Mahasiswa:</strong> ${studentName}</p>
-                    <p><strong>Waktu Scan:</strong> ${new Date(scanTime).toLocaleString('id-ID')}</p>
-                    <p><strong>QR Code:</strong> ${qrCode}</p>
-                    
-                    <div style="margin-top: 20px; padding: 15px; background: #e8f5e8; border-radius: 8px;">
-                        <h5>✅ Verifikasi Kehadiran</h5>
-                        <p>Mahasiswa telah berhasil melakukan scan QR Code pada waktu yang tercatat.</p>
-                        <p><small>Sistem mencatat waktu scan secara otomatis dan tidak dapat dimanipulasi.</small></p>
-                    </div>
-                </div>
-            `;
+        function loadSessions() {
+            const kelasId = document.getElementById('kelas_id').value;
+            const sessionSelect = document.getElementById('session_id');
             
-            document.getElementById('evidenceContent').innerHTML = content;
-            document.getElementById('evidenceModal').style.display = 'block';
-        }
-        
-        function closeEvidenceModal() {
-            document.getElementById('evidenceModal').style.display = 'none';
-        }
-        
-        // Close modal when clicking outside
-        window.onclick = function(event) {
-            const modal = document.getElementById('evidenceModal');
-            if (event.target === modal) {
-                closeEvidenceModal();
+            // Clear current options
+            sessionSelect.innerHTML = '<option value="">Semua Sesi</option>';
+            
+            if (kelasId) {
+                fetch(`../dosen/get-sessions.php?kelas_id=${kelasId}`)
+                    .then(response => response.json())
+                    .then(data => {
+                        if (data.success) {
+                            data.sessions.forEach(session => {
+                                const option = document.createElement('option');
+                                option.value = session.id;
+                                option.textContent = `${session.formatted_date} (${session.jam_mulai} - ${session.jam_selesai})`;
+                                sessionSelect.appendChild(option);
+                            });
+                        }
+                    })
+                    .catch(error => console.error('Error loading sessions:', error));
             }
         }
     </script>

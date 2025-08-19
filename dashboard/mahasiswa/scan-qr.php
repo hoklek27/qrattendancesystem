@@ -5,118 +5,6 @@ require_once '../../config/session.php';
 requireRole('mahasiswa');
 
 $current_user = getCurrentUser();
-$message = '';
-$success = false;
-
-// Handle file upload for QR image
-if (isset($_FILES['qr_image']) && $_FILES['qr_image']['error'] === UPLOAD_ERR_OK) {
-    $uploadDir = '../../uploads/qr_temp/';
-    if (!is_dir($uploadDir)) {
-        mkdir($uploadDir, 0777, true);
-    }
-    
-    $fileName = uniqid() . '_' . $_FILES['qr_image']['name'];
-    $uploadPath = $uploadDir . $fileName;
-    
-    if (move_uploaded_file($_FILES['qr_image']['tmp_name'], $uploadPath)) {
-        // Here you would typically use a QR code reading library
-        // For now, we'll show instructions to manually read the QR
-        $message = 'Gambar QR berhasil diupload. Silakan baca kode QR dari gambar dan masukkan secara manual di bawah.';
-        
-        // Clean up uploaded file after processing
-        unlink($uploadPath);
-    }
-}
-
-if ($_POST && isset($_POST['qr_data'])) {
-    $qr_data = trim($_POST['qr_data'] ?? '');
-    
-    if (empty($qr_data)) {
-        $message = 'Data QR Code tidak boleh kosong';
-    } else {
-        try {
-            $database = new Database();
-            $db = $database->getConnection();
-            
-            $qr_info = null;
-            
-            // Try to decode as JSON first
-            $decoded = json_decode($qr_data, true);
-            if ($decoded && isset($decoded['session_id']) && isset($decoded['qr_code'])) {
-                $qr_info = $decoded;
-            } else {
-                // Try as plain QR code
-                if (strpos($qr_data, 'QR_') === 0) {
-                    // Find session by QR code
-                    $query = "SELECT id, qr_code, kelas_id, expires_at FROM qr_sessions WHERE qr_code = ? AND status = 'active'";
-                    $stmt = $db->prepare($query);
-                    $stmt->execute([$qr_data]);
-                    
-                    if ($stmt->rowCount() > 0) {
-                        $session = $stmt->fetch(PDO::FETCH_ASSOC);
-                        $qr_info = [
-                            'session_id' => $session['id'],
-                            'qr_code' => $session['qr_code'],
-                            'kelas_id' => $session['kelas_id'],
-                            'expires_at' => $session['expires_at']
-                        ];
-                    }
-                }
-            }
-            
-            if (!$qr_info) {
-                $message = 'Format QR Code tidak valid. Pastikan Anda menyalin kode dengan benar.';
-            } else {
-                // Verify QR session is still active
-                $query = "SELECT qs.*, k.nama_kelas, mk.nama_mk, mk.kode_mk
-                          FROM qr_sessions qs 
-                          JOIN kelas k ON qs.kelas_id = k.id 
-                          JOIN mata_kuliah mk ON k.mata_kuliah_id = mk.id 
-                          WHERE qs.id = ? AND qs.qr_code = ? AND qs.status = 'active' AND qs.expires_at > NOW()";
-                $stmt = $db->prepare($query);
-                $stmt->execute([$qr_info['session_id'], $qr_info['qr_code']]);
-                
-                if ($stmt->rowCount() === 0) {
-                    $message = 'QR Code tidak valid, tidak aktif, atau sudah kedaluwarsa';
-                } else {
-                    $session = $stmt->fetch(PDO::FETCH_ASSOC);
-                    
-                    // Check if student is enrolled in this class
-                    $query = "SELECT id FROM enrollments WHERE mahasiswa_id = ? AND kelas_id = ?";
-                    $stmt = $db->prepare($query);
-                    $stmt->execute([$current_user['id'], $session['kelas_id']]);
-                    
-                    if ($stmt->rowCount() === 0) {
-                        $message = 'Anda tidak terdaftar di kelas ' . $session['kode_mk'] . ' - ' . $session['nama_kelas'];
-                    } else {
-                        // Check if already attended
-                        $query = "SELECT id, scan_time FROM attendance WHERE qr_session_id = ? AND mahasiswa_id = ?";
-                        $stmt = $db->prepare($query);
-                        $stmt->execute([$qr_info['session_id'], $current_user['id']]);
-                        
-                        if ($stmt->rowCount() > 0) {
-                            $existing = $stmt->fetch(PDO::FETCH_ASSOC);
-                            $message = 'Anda sudah melakukan absensi untuk sesi ini pada ' . date('d/m/Y H:i:s', strtotime($existing['scan_time']));
-                        } else {
-                            // Record attendance
-                            $query = "INSERT INTO attendance (qr_session_id, mahasiswa_id, status, scan_time) VALUES (?, ?, 'hadir', NOW())";
-                            $stmt = $db->prepare($query);
-                            
-                            if ($stmt->execute([$qr_info['session_id'], $current_user['id']])) {
-                                $message = 'Absensi berhasil dicatat untuk ' . $session['kode_mk'] . ' - ' . $session['nama_mk'] . ' (' . $session['nama_kelas'] . ')';
-                                $success = true;
-                            } else {
-                                $message = 'Gagal mencatat absensi. Silakan coba lagi.';
-                            }
-                        }
-                    }
-                }
-            }
-        } catch (Exception $e) {
-            $message = 'Terjadi kesalahan: ' . $e->getMessage();
-        }
-    }
-}
 ?>
 
 <!DOCTYPE html>
@@ -127,127 +15,220 @@ if ($_POST && isset($_POST['qr_data'])) {
     <title>Scan QR Code - Dashboard Mahasiswa</title>
     <link rel="stylesheet" href="../../assets/css/style.css">
     <style>
-        .scanner-container {
-            max-width: 500px;
+        .scan-container {
+            max-width: 800px;
             margin: 0 auto;
         }
         
-        .camera-container {
-            position: relative;
-            width: 100%;
-            max-width: 400px;
-            margin: 0 auto;
-            background: #000;
-            border-radius: 8px;
-            overflow: hidden;
-        }
-        
-        #camera {
-            width: 100%;
-            height: 300px;
-            object-fit: cover;
-        }
-        
-        .scanner-overlay {
-            position: absolute;
-            top: 50%;
-            left: 50%;
-            transform: translate(-50%, -50%);
-            width: 200px;
-            height: 200px;
-            border: 2px solid #00ff00;
-            border-radius: 8px;
-            box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.5);
-        }
-        
-        .input-method {
-            margin-top: 20px;
-            padding: 20px;
-            background: #f8f9fa;
-            border-radius: 8px;
-            border: 1px solid #dee2e6;
-        }
-        
-        .method-tabs {
+        .scan-tabs {
             display: flex;
-            margin-bottom: 20px;
-            border-bottom: 1px solid #dee2e6;
+            background: #f8f9fa;
+            border-radius: 8px 8px 0 0;
+            overflow: hidden;
+            margin-bottom: 0;
         }
         
-        .method-tab {
-            padding: 10px 20px;
-            background: none;
+        .scan-tab {
+            flex: 1;
+            padding: 15px 20px;
+            background: #e9ecef;
             border: none;
             cursor: pointer;
-            border-bottom: 2px solid transparent;
-            font-weight: 500;
-        }
-        
-        .method-tab.active {
-            border-bottom-color: #2d5a27;
-            color: #2d5a27;
-        }
-        
-        .method-content {
-            display: none;
-        }
-        
-        .method-content.active {
-            display: block;
-        }
-        
-        .status-indicator {
-            padding: 10px;
-            margin: 10px 0;
-            border-radius: 4px;
-            text-align: center;
             font-weight: bold;
-        }
-        
-        .status-waiting {
-            background: #fff3cd;
-            color: #856404;
-            border: 1px solid #ffeaa7;
-        }
-        
-        .status-scanning {
-            background: #d4edda;
-            color: #155724;
-            border: 1px solid #c3e6cb;
-        }
-        
-        .status-error {
-            background: #f8d7da;
-            color: #721c24;
-            border: 1px solid #f5c6cb;
-        }
-        
-        .https-warning {
-            background: #fff3cd;
-            border: 1px solid #ffeaa7;
-            color: #856404;
-            padding: 15px;
-            border-radius: 8px;
-            margin-bottom: 20px;
-        }
-        
-        .file-upload-area {
-            border: 2px dashed #dee2e6;
-            border-radius: 8px;
-            padding: 30px;
-            text-align: center;
-            background: #f8f9fa;
             transition: all 0.3s ease;
         }
         
-        .file-upload-area:hover {
-            border-color: #2d5a27;
-            background: #e8f5e8;
+        .scan-tab.active {
+            background: white;
+            color: #2d5a27;
         }
         
-        .file-upload-area.dragover {
+        .scan-tab:hover {
+            background: #dee2e6;
+        }
+        
+        .scan-tab.active:hover {
+            background: white;
+        }
+        
+        .scan-content {
+            background: white;
+            border-radius: 0 0 8px 8px;
+            padding: 30px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        }
+        
+        .tab-panel {
+            display: none;
+        }
+        
+        .tab-panel.active {
+            display: block;
+        }
+        
+        .camera-container {
+            text-align: center;
+            margin-bottom: 20px;
+        }
+        
+        #video {
+            width: 100%;
+            max-width: 400px;
+            height: 300px;
+            border: 2px solid #2d5a27;
+            border-radius: 8px;
+            background: #000;
+        }
+        
+        .camera-controls {
+            margin: 20px 0;
+        }
+        
+        .upload-area {
+            border: 2px dashed #2d5a27;
+            border-radius: 8px;
+            padding: 40px 20px;
+            text-align: center;
+            background: #f8f9fa;
+            transition: all 0.3s ease;
+            cursor: pointer;
+        }
+        
+        .upload-area:hover {
+            background: #e9ecef;
+            border-color: #1e3a1a;
+        }
+        
+        .upload-area.dragover {
+            background: #d4edda;
+            border-color: #28a745;
+        }
+        
+        .upload-icon {
+            font-size: 3em;
+            color: #2d5a27;
+            margin-bottom: 15px;
+        }
+        
+        .manual-input {
+            width: 100%;
+            min-height: 120px;
+            padding: 15px;
+            border: 2px solid #dee2e6;
+            border-radius: 8px;
+            font-family: monospace;
+            font-size: 14px;
+            resize: vertical;
+        }
+        
+        .manual-input:focus {
             border-color: #2d5a27;
-            background: #e8f5e8;
+            outline: none;
+        }
+        
+        .status-selector {
+            margin: 20px 0;
+            padding: 20px;
+            background: #f8f9fa;
+            border-radius: 8px;
+        }
+        
+        .status-options {
+            display: flex;
+            gap: 15px;
+            flex-wrap: wrap;
+            justify-content: center;
+        }
+        
+        .status-option {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 10px 15px;
+            border: 2px solid #dee2e6;
+            border-radius: 8px;
+            background: white;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+        
+        .status-option:hover {
+            border-color: #2d5a27;
+        }
+        
+        .status-option.selected {
+            border-color: #2d5a27;
+            background: #d4edda;
+        }
+        
+        .status-option input[type="radio"] {
+            margin: 0;
+        }
+        
+        .result-container {
+            margin-top: 20px;
+            padding: 20px;
+            border-radius: 8px;
+            display: none;
+        }
+        
+        .result-success {
+            background: #d4edda;
+            border: 1px solid #c3e6cb;
+            color: #155724;
+        }
+        
+        .result-error {
+            background: #f8d7da;
+            border: 1px solid #f5c6cb;
+            color: #721c24;
+        }
+        
+        .loading {
+            display: none;
+            text-align: center;
+            padding: 20px;
+        }
+        
+        .spinner {
+            border: 4px solid #f3f3f3;
+            border-top: 4px solid #2d5a27;
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 15px;
+        }
+        
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        
+        .preview-image {
+            max-width: 300px;
+            max-height: 300px;
+            border: 2px solid #2d5a27;
+            border-radius: 8px;
+            margin: 15px 0;
+        }
+        
+        @media (max-width: 768px) {
+            .scan-tabs {
+                flex-direction: column;
+            }
+            
+            .scan-content {
+                padding: 20px;
+            }
+            
+            .status-options {
+                flex-direction: column;
+            }
+            
+            .status-option {
+                justify-content: center;
+            }
         }
     </style>
 </head>
@@ -268,124 +249,100 @@ if ($_POST && isset($_POST['qr_data'])) {
         
         <div class="dashboard-content">
             <div class="container">
-                <div class="card">
-                    <div class="card-header">
-                        <h3 class="card-title">Scan QR Code untuk Absensi</h3>
+                <div class="scan-container">
+                    <!-- Tabs -->
+                    <div class="scan-tabs">
+                        <button class="scan-tab active" onclick="switchTab('camera')">📷 Kamera</button>
+                        <button class="scan-tab" onclick="switchTab('upload')">📁 Upload Gambar</button>
+                        <button class="scan-tab" onclick="switchTab('manual')">⌨️ Input Manual</button>
                     </div>
-                    <div class="card-body">
-                        <?php if ($message): ?>
-                            <div class="alert alert-<?php echo $success ? 'success' : 'error'; ?>">
-                                <?php echo $message; ?>
+                    
+                    <div class="scan-content">
+                        <!-- Status Selector -->
+                        <div class="status-selector">
+                            <h4 style="text-align: center; margin-bottom: 15px;">Pilih Status Kehadiran:</h4>
+                            <div class="status-options">
+                                <label class="status-option selected">
+                                    <input type="radio" name="attendance_status" value="hadir" checked>
+                                    <span>✅ Hadir</span>
+                                </label>
+                                <label class="status-option">
+                                    <input type="radio" name="attendance_status" value="sakit">
+                                    <span>🤒 Sakit</span>
+                                </label>
+                                <label class="status-option">
+                                    <input type="radio" name="attendance_status" value="izin">
+                                    <span>📝 Izin</span>
+                                </label>
                             </div>
-                        <?php endif; ?>
-                        
-                        <div class="https-warning">
-                            <strong>⚠️ Perhatian:</strong> Jika kamera tidak berfungsi di HP, ini karena browser memerlukan HTTPS untuk akses kamera. 
-                            Gunakan salah satu metode alternatif di bawah ini.
                         </div>
                         
-                        <div class="scanner-container">
-                            <div class="method-tabs">
-                                <button class="method-tab active" onclick="switchMethod('camera')">📷 Kamera</button>
-                                <!-- <button class="method-tab" onclick="switchMethod('upload')">📁 Upload Gambar</button> -->
-                                <button class="method-tab" onclick="switchMethod('manual')">⌨️ Input Manual</button>
+                        <!-- Camera Tab -->
+                        <div id="camera-tab" class="tab-panel active">
+                            <div class="camera-container">
+                                <video id="video" autoplay muted playsinline></video>
+                                <canvas id="canvas" style="display: none;"></canvas>
                             </div>
                             
-                            <!-- Camera Method -->
-                            <div id="camera-method" class="method-content active">
-                                <div id="status-indicator" class="status-indicator status-waiting">
-                                    Klik "Mulai Kamera" untuk memulai scan
-                                </div>
-                                
-                                <div class="camera-container">
-                                    <video id="camera" autoplay playsinline muted></video>
-                                    <div class="scanner-overlay"></div>
-                                </div>
-                                
-                                <div style="text-align: center; margin-top: 20px;">
-                                    <button id="startCamera" class="btn btn-primary">Mulai Kamera</button>
-                                    <button id="stopCamera" class="btn btn-secondary" style="display: none;">Stop Kamera</button>
-                                    <button id="switchCamera" class="btn btn-info" style="display: none;">Ganti Kamera</button>
-                                </div>
+                            <div class="camera-controls">
+                                <button id="startCamera" class="btn btn-primary">📷 Mulai Kamera</button>
+                                <button id="captureBtn" class="btn btn-success" style="display: none;">📸 Ambil Foto</button>
+                                <button id="stopCamera" class="btn btn-secondary" style="display: none;">⏹️ Stop Kamera</button>
                             </div>
                             
-                            <!-- Upload Method
-                            <div id="upload-method" class="method-content">
-                                <form method="POST" enctype="multipart/form-data" id="uploadForm">
-                                    <div class="file-upload-area" id="fileUploadArea">
-                                        <div>
-                                            <h4>📱 Upload Foto QR Code</h4>
-                                            <p>Ambil foto QR Code dengan kamera HP, lalu upload di sini</p>
-                                            <input type="file" id="qr_image" name="qr_image" accept="image/*" capture="camera" style="display: none;">
-                                            <button type="button" class="btn btn-primary" onclick="document.getElementById('qr_image').click()">
-                                                Pilih/Ambil Foto
-                                            </button>
-                                            <p style="margin-top: 10px; font-size: 14px; color: #666;">
-                                                Atau drag & drop foto QR code ke area ini
-                                            </p>
-                                        </div>
-                                    </div>
-                                    <div id="uploadPreview" style="margin-top: 15px; display: none;">
-                                        <img id="previewImage" style="max-width: 200px; border-radius: 8px;">
-                                        <p>Foto berhasil dipilih. Klik tombol di bawah untuk upload.</p>
-                                        <button type="submit" class="btn btn-success">Upload & Proses</button>
-                                    </div>
-                                </form>
-                            </div> -->
-                            
-                            <!-- Manual Method -->
-                            <div id="manual-method" class="method-content">
-                                <form method="POST" id="manualForm">
-                                    <div class="form-group">
-                                        <label for="qr_data">Kode QR</label>
-                                        <textarea id="qr_data" name="qr_data" class="form-control" rows="4" placeholder="Masukkan kode QR di sini...
-
-Contoh format yang didukung:
-1. QR_1234567890_1_5678
-2. {"session_id":123,"qr_code":"QR_1234567890_1_5678","kelas_id":1}"></textarea>
-                                        <small class="form-text text-muted">
-                                            Salin kode QR yang ditampilkan dosen (bisa berupa kode sederhana atau JSON lengkap)
-                                        </small>
-                                    </div>
-                                    <button type="submit" class="btn btn-primary">Submit Absensi</button>
-                                </form>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-                
-                <div class="card">
-                    <div class="card-header">
-                        <h3 class="card-title">Solusi Masalah Kamera</h3>
-                    </div>
-                    <div class="card-body">
-                        <div class="row">
-                            <div class="col-md-6">
-                                <h5>🔒 Mengapa Kamera Tidak Berfungsi?</h5>
+                            <div id="cameraError" class="alert alert-warning" style="display: none;">
+                                <strong>⚠️ Kamera tidak dapat diakses!</strong><br>
+                                Ini biasanya terjadi karena:
                                 <ul>
-                                    <li>Browser memerlukan HTTPS untuk akses kamera</li>
-                                    <li>Localhost di HP tidak memiliki sertifikat SSL</li>
-                                    <li>Kebijakan keamanan browser mobile</li>
+                                    <li>Akses melalui HTTP (bukan HTTPS)</li>
+                                    <li>Permission kamera ditolak</li>
+                                    <li>Kamera sedang digunakan aplikasi lain</li>
                                 </ul>
-                                
-                                <h5 style="margin-top: 20px;">💡 Solusi yang Tersedia:</h5>
-                                <ol>
-                                    <li><strong>Upload Foto:</strong> Ambil foto QR dengan kamera HP</li>
-                                    <li><strong>Input Manual:</strong> Ketik/salin kode QR</li>
-                                    <li><strong>Gunakan HTTPS:</strong> Setup SSL untuk localhost</li>
-                                </ol>
+                                Silakan gunakan metode <strong>Upload Gambar</strong> atau <strong>Input Manual</strong>.
                             </div>
                         </div>
                         
-                        <div style="margin-top: 20px; padding: 15px; background: #e8f5e8; border-radius: 8px;">
-                            <strong>🎯 Rekomendasi untuk Penggunaan Sehari-hari:</strong>
-                            <ul style="margin-top: 10px; margin-bottom: 0;">
-                                <li><strong>Di Laptop/PC:</strong> Gunakan kamera untuk scan langsung</li>
-                                <li><strong>Di HP:</strong> Gunakan upload foto atau input manual</li>
-                                <li><strong>Untuk Produksi:</strong> Setup HTTPS atau gunakan hosting dengan SSL</li>
-                                <li><strong>Untuk Testing:</strong> Ngrok adalah solusi tercepat</li>
-                            </ul>
+                        <!-- Upload Tab -->
+                        <div id="upload-tab" class="tab-panel">
+                            <div class="upload-area" onclick="document.getElementById('fileInput').click()">
+                                <div class="upload-icon">📁</div>
+                                <h4>Klik untuk memilih gambar QR Code</h4>
+                                <p>atau drag & drop gambar ke sini</p>
+                                <p><small>Format: JPG, PNG, WebP (Max: 5MB)</small></p>
+                            </div>
+                            
+                            <input type="file" id="fileInput" accept="image/*" capture="environment" style="display: none;">
+                            
+                            <div id="imagePreview" style="text-align: center; display: none;">
+                                <img id="previewImg" class="preview-image" alt="Preview">
+                                <br>
+                                <button id="processImage" class="btn btn-primary">🔍 Proses Gambar</button>
+                                <button id="clearImage" class="btn btn-secondary">🗑️ Hapus</button>
+                            </div>
                         </div>
+                        
+                        <!-- Manual Tab -->
+                        <div id="manual-tab" class="tab-panel">
+                            <h4>Input QR Code Manual</h4>
+                            <p>Paste kode QR yang diberikan dosen:</p>
+                            
+                            <textarea id="manualInput" class="manual-input" 
+                                      placeholder="Paste QR code di sini...&#10;&#10;Format bisa berupa:&#10;1. JSON: {&quot;session_id&quot;:123,&quot;qr_code&quot;:&quot;ABC123&quot;}&#10;2. String sederhana: ABC123XYZ"></textarea>
+                            
+                            <div style="margin-top: 15px;">
+                                <button id="submitManual" class="btn btn-primary">✅ Submit Absensi</button>
+                                <button id="clearManual" class="btn btn-secondary">🗑️ Clear</button>
+                            </div>
+                        </div>
+                        
+                        <!-- Loading -->
+                        <div id="loading" class="loading">
+                            <div class="spinner"></div>
+                            <p>Memproses absensi...</p>
+                        </div>
+                        
+                        <!-- Result -->
+                        <div id="result" class="result-container"></div>
                     </div>
                 </div>
             </div>
@@ -394,209 +351,302 @@ Contoh format yang didukung:
 
     <script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js"></script>
     <script>
-        const video = document.getElementById('camera');
-        const startBtn = document.getElementById('startCamera');
-        const stopBtn = document.getElementById('stopCamera');
-        const switchBtn = document.getElementById('switchCamera');
-        const qrDataInput = document.getElementById('qr_data');
-        const statusIndicator = document.getElementById('status-indicator');
-        const fileUploadArea = document.getElementById('fileUploadArea');
-        const qrImageInput = document.getElementById('qr_image');
-        const uploadPreview = document.getElementById('uploadPreview');
-        const previewImage = document.getElementById('previewImage');
-        
         let stream = null;
-        let scanning = false;
-        let currentFacingMode = 'environment';
+        let isProcessing = false;
         
-        // Method switching
-        function switchMethod(method) {
-            // Update tabs
-            document.querySelectorAll('.method-tab').forEach(tab => tab.classList.remove('active'));
+        // Tab switching
+        function switchTab(tabName) {
+            // Update tab buttons
+            document.querySelectorAll('.scan-tab').forEach(tab => tab.classList.remove('active'));
             event.target.classList.add('active');
             
-            // Update content
-            document.querySelectorAll('.method-content').forEach(content => content.classList.remove('active'));
-            document.getElementById(method + '-method').classList.add('active');
+            // Update tab panels
+            document.querySelectorAll('.tab-panel').forEach(panel => panel.classList.remove('active'));
+            document.getElementById(tabName + '-tab').classList.add('active');
             
-            // Stop camera if switching away from camera method
-            if (method !== 'camera') {
+            // Stop camera if switching away from camera tab
+            if (tabName !== 'camera' && stream) {
                 stopCamera();
             }
         }
         
+        // Status selector
+        document.querySelectorAll('.status-option').forEach(option => {
+            option.addEventListener('click', function() {
+                document.querySelectorAll('.status-option').forEach(opt => opt.classList.remove('selected'));
+                this.classList.add('selected');
+                this.querySelector('input[type="radio"]').checked = true;
+            });
+        });
+        
         // Camera functionality
-        startBtn.addEventListener('click', startCamera);
-        stopBtn.addEventListener('click', stopCamera);
-        switchBtn.addEventListener('click', switchCamera);
-
-        function updateStatus(message, type = 'waiting') {
-            statusIndicator.textContent = message;
-            statusIndicator.className = `status-indicator status-${type}`;
-        }
-
+        document.getElementById('startCamera').addEventListener('click', startCamera);
+        document.getElementById('captureBtn').addEventListener('click', captureImage);
+        document.getElementById('stopCamera').addEventListener('click', stopCamera);
+        
         async function startCamera() {
             try {
-                updateStatus('Meminta akses kamera...', 'waiting');
-                
                 const constraints = {
                     video: {
-                        facingMode: currentFacingMode,
+                        facingMode: 'environment',
                         width: { ideal: 640 },
                         height: { ideal: 480 }
                     }
                 };
                 
                 stream = await navigator.mediaDevices.getUserMedia(constraints);
+                const video = document.getElementById('video');
                 video.srcObject = stream;
                 
-                video.onloadedmetadata = () => {
-                    video.play();
-                    startBtn.style.display = 'none';
-                    stopBtn.style.display = 'inline-block';
-                    switchBtn.style.display = 'inline-block';
-                    
-                    scanning = true;
-                    updateStatus('Kamera aktif - Arahkan ke QR Code', 'scanning');
-                    scanQRCode();
-                };
+                document.getElementById('startCamera').style.display = 'none';
+                document.getElementById('captureBtn').style.display = 'inline-block';
+                document.getElementById('stopCamera').style.display = 'inline-block';
+                document.getElementById('cameraError').style.display = 'none';
                 
-            } catch (err) {
-                console.error('Camera error:', err);
-                updateStatus('Gagal mengakses kamera', 'error');
-                
-                let errorMsg = 'Tidak dapat mengakses kamera. ';
-                if (err.name === 'NotAllowedError') {
-                    errorMsg += 'Izinkan akses kamera di browser Anda, atau gunakan metode upload/manual.';
-                } else if (err.name === 'NotFoundError') {
-                    errorMsg += 'Kamera tidak ditemukan. Gunakan metode upload/manual.';
-                } else if (err.name === 'NotSupportedError') {
-                    errorMsg += 'Browser tidak mendukung kamera. Gunakan metode upload/manual.';
-                } else {
-                    errorMsg += 'Coba gunakan HTTPS atau metode alternatif.';
-                }
-                
-                alert(errorMsg);
+            } catch (error) {
+                console.error('Camera error:', error);
+                document.getElementById('cameraError').style.display = 'block';
             }
         }
-
+        
         function stopCamera() {
             if (stream) {
                 stream.getTracks().forEach(track => track.stop());
                 stream = null;
             }
             
-            video.srcObject = null;
-            scanning = false;
-            
-            startBtn.style.display = 'inline-block';
-            stopBtn.style.display = 'none';
-            switchBtn.style.display = 'none';
-            
-            updateStatus('Kamera dimatikan', 'waiting');
+            document.getElementById('startCamera').style.display = 'inline-block';
+            document.getElementById('captureBtn').style.display = 'none';
+            document.getElementById('stopCamera').style.display = 'none';
         }
-
-        async function switchCamera() {
-            stopCamera();
-            currentFacingMode = currentFacingMode === 'environment' ? 'user' : 'environment';
-            await startCamera();
-        }
-
-        function scanQRCode() {
-            if (!scanning || !video.videoWidth || !video.videoHeight) {
-                if (scanning) {
-                    requestAnimationFrame(scanQRCode);
-                }
-                return;
-            }
+        
+        function captureImage() {
+            const video = document.getElementById('video');
+            const canvas = document.getElementById('canvas');
+            const context = canvas.getContext('2d');
             
-            try {
-                const canvas = document.createElement('canvas');
-                const context = canvas.getContext('2d');
-                
-                canvas.width = video.videoWidth;
-                canvas.height = video.videoHeight;
-                context.drawImage(video, 0, 0, canvas.width, canvas.height);
-                
-                const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
-                const code = jsQR(imageData.data, imageData.width, imageData.height);
-                
-                if (code) {
-                    updateStatus('QR Code terdeteksi!', 'scanning');
-                    qrDataInput.value = code.data;
-                    stopCamera();
-                    
-                    const preview = code.data.length > 100 ? code.data.substring(0, 100) + '...' : code.data;
-                    
-                    if (confirm(`QR Code berhasil di-scan!\n\nData: ${preview}\n\nLanjutkan absensi?`)) {
-                        document.getElementById('manualForm').submit();
-                    } else {
-                        updateStatus('Scan dibatalkan', 'waiting');
-                    }
-                }
-            } catch (error) {
-                console.error('Scan error:', error);
-            }
+            canvas.width = video.videoWidth;
+            canvas.height = video.videoHeight;
+            context.drawImage(video, 0, 0);
             
-            if (scanning) {
-                requestAnimationFrame(scanQRCode);
+            // Try to decode QR code
+            const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
+            const code = jsQR(imageData.data, imageData.width, imageData.height);
+            
+            if (code) {
+                submitAttendance(code.data);
+            } else {
+                showResult('error', 'QR Code tidak terdeteksi. Pastikan QR Code terlihat jelas dan coba lagi.');
             }
         }
-
-        // File upload functionality
-        qrImageInput.addEventListener('change', function(e) {
-            const file = e.target.files[0];
-            if (file) {
-                const reader = new FileReader();
-                reader.onload = function(e) {
-                    previewImage.src = e.target.result;
-                    uploadPreview.style.display = 'block';
-                };
-                reader.readAsDataURL(file);
-            }
-        });
-
-        // Drag and drop functionality
-        fileUploadArea.addEventListener('dragover', function(e) {
+        
+        // Upload functionality
+        const fileInput = document.getElementById('fileInput');
+        const uploadArea = document.querySelector('.upload-area');
+        
+        // Drag and drop
+        uploadArea.addEventListener('dragover', (e) => {
             e.preventDefault();
-            fileUploadArea.classList.add('dragover');
+            uploadArea.classList.add('dragover');
         });
-
-        fileUploadArea.addEventListener('dragleave', function(e) {
-            e.preventDefault();
-            fileUploadArea.classList.remove('dragover');
+        
+        uploadArea.addEventListener('dragleave', () => {
+            uploadArea.classList.remove('dragover');
         });
-
-        fileUploadArea.addEventListener('drop', function(e) {
+        
+        uploadArea.addEventListener('drop', (e) => {
             e.preventDefault();
-            fileUploadArea.classList.remove('dragover');
+            uploadArea.classList.remove('dragover');
             
             const files = e.dataTransfer.files;
             if (files.length > 0) {
-                qrImageInput.files = files;
-                qrImageInput.dispatchEvent(new Event('change'));
+                handleFileSelect(files[0]);
             }
         });
-
-        // Manual form validation
-        document.getElementById('manualForm').addEventListener('submit', function(e) {
-            const qrData = qrDataInput.value.trim();
-            if (!qrData) {
-                e.preventDefault();
-                alert('Masukkan kode QR terlebih dahulu!');
+        
+        fileInput.addEventListener('change', (e) => {
+            if (e.target.files.length > 0) {
+                handleFileSelect(e.target.files[0]);
+            }
+        });
+        
+        function handleFileSelect(file) {
+            if (!file.type.startsWith('image/')) {
+                showResult('error', 'File harus berupa gambar (JPG, PNG, WebP)');
                 return;
             }
             
-            if (!qrData.includes('QR_') && !qrData.includes('session_id')) {
-                if (!confirm('Format kode QR mungkin tidak valid. Lanjutkan?')) {
-                    e.preventDefault();
-                    return;
-                }
+            if (file.size > 5 * 1024 * 1024) {
+                showResult('error', 'Ukuran file maksimal 5MB');
+                return;
+            }
+            
+            const reader = new FileReader();
+            reader.onload = (e) => {
+                const img = document.getElementById('previewImg');
+                img.src = e.target.result;
+                document.getElementById('imagePreview').style.display = 'block';
+            };
+            reader.readAsDataURL(file);
+        }
+        
+        document.getElementById('processImage').addEventListener('click', () => {
+            const img = document.getElementById('previewImg');
+            const canvas = document.createElement('canvas');
+            const context = canvas.getContext('2d');
+            
+            canvas.width = img.naturalWidth;
+            canvas.height = img.naturalHeight;
+            context.drawImage(img, 0, 0);
+            
+            const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
+            const code = jsQR(imageData.data, imageData.width, imageData.height);
+            
+            if (code) {
+                submitAttendance(code.data);
+            } else {
+                showResult('error', 'QR Code tidak terdeteksi dalam gambar. Pastikan gambar jelas dan QR Code terlihat.');
             }
         });
-
-        // Stop camera when page is unloaded
-        window.addEventListener('beforeunload', stopCamera);
+        
+        document.getElementById('clearImage').addEventListener('click', () => {
+            document.getElementById('imagePreview').style.display = 'none';
+            fileInput.value = '';
+        });
+        
+        // Manual input
+        document.getElementById('submitManual').addEventListener('click', () => {
+            const input = document.getElementById('manualInput').value.trim();
+            if (!input) {
+                showResult('error', 'Silakan masukkan kode QR');
+                return;
+            }
+            
+            submitAttendance(input);
+        });
+        
+        document.getElementById('clearManual').addEventListener('click', () => {
+            document.getElementById('manualInput').value = '';
+        });
+        
+        // Submit attendance
+        async function submitAttendance(qrData) {
+            if (isProcessing) return;
+            
+            isProcessing = true;
+            showLoading(true);
+            hideResult();
+            
+            const selectedStatus = document.querySelector('input[name="attendance_status"]:checked').value;
+            
+            // Get location if available
+            let latitude = null;
+            let longitude = null;
+            
+            if (navigator.geolocation) {
+                try {
+                    const position = await new Promise((resolve, reject) => {
+                        navigator.geolocation.getCurrentPosition(resolve, reject, {
+                            timeout: 5000,
+                            enableHighAccuracy: false
+                        });
+                    });
+                    latitude = position.coords.latitude;
+                    longitude = position.coords.longitude;
+                } catch (error) {
+                    console.log('Location not available:', error);
+                }
+            }
+            
+            try {
+                const response = await fetch('submit-attendance.php', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        qr_code: qrData,
+                        status: selectedStatus,
+                        latitude: latitude,
+                        longitude: longitude
+                    })
+                });
+                
+                const result = await response.json();
+                
+                if (result.success) {
+                    showResult('success', result.message, result.data);
+                    
+                    // Clear inputs after successful submission
+                    document.getElementById('manualInput').value = '';
+                    if (document.getElementById('imagePreview').style.display === 'block') {
+                        document.getElementById('clearImage').click();
+                    }
+                } else {
+                    showResult('error', result.message);
+                }
+                
+            } catch (error) {
+                showResult('error', 'Terjadi kesalahan koneksi. Silakan coba lagi.');
+                console.error('Submit error:', error);
+            }
+            
+            showLoading(false);
+            isProcessing = false;
+        }
+        
+        function showLoading(show) {
+            document.getElementById('loading').style.display = show ? 'block' : 'none';
+        }
+        
+        function showResult(type, message, data = null) {
+            const resultDiv = document.getElementById('result');
+            resultDiv.className = `result-container result-${type}`;
+            
+            let html = `<strong>${type === 'success' ? '✅ Berhasil!' : '❌ Error!'}</strong><br>${message}`;
+            
+            if (data) {
+                html += `
+                    <div style="margin-top: 15px; padding: 15px; background: rgba(255,255,255,0.3); border-radius: 8px;">
+                        <strong>Detail Absensi:</strong><br>
+                        📚 Mata Kuliah: ${data.mata_kuliah}<br>
+                        🏫 Kelas: ${data.kelas}<br>
+                        📅 Tanggal: ${data.tanggal}<br>
+                        ⏰ Waktu: ${data.waktu}<br>
+                        📋 Status: ${data.status}
+                    </div>
+                `;
+            }
+            
+            resultDiv.innerHTML = html;
+            resultDiv.style.display = 'block';
+            
+            // Auto hide after 10 seconds for success
+            if (type === 'success') {
+                setTimeout(() => {
+                    hideResult();
+                }, 10000);
+            }
+        }
+        
+        function hideResult() {
+            document.getElementById('result').style.display = 'none';
+        }
+        
+        // Auto-start camera on page load if on camera tab
+        window.addEventListener('load', () => {
+            // Check if HTTPS or localhost
+            if (location.protocol === 'https:' || location.hostname === 'localhost' || location.hostname === '127.0.0.1') {
+                // Auto start camera after 1 second
+                setTimeout(() => {
+                    if (document.getElementById('camera-tab').classList.contains('active')) {
+                        startCamera();
+                    }
+                }, 1000);
+            } else {
+                document.getElementById('cameraError').style.display = 'block';
+            }
+        });
     </script>
 </body>
 </html>
