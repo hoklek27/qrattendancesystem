@@ -287,7 +287,7 @@ if ($_POST && isset($_POST['qr_data'])) {
                         <div class="scanner-container">
                             <div class="method-tabs">
                                 <button class="method-tab active" onclick="switchMethod('camera')">📷 Kamera</button>
-                                <button class="method-tab" onclick="switchMethod('upload')">📁 Upload Gambar</button>
+                                <!-- <button class="method-tab" onclick="switchMethod('upload')">📁 Upload Gambar</button> -->
                                 <button class="method-tab" onclick="switchMethod('manual')">⌨️ Input Manual</button>
                             </div>
                             
@@ -309,7 +309,7 @@ if ($_POST && isset($_POST['qr_data'])) {
                                 </div>
                             </div>
                             
-                            <!-- Upload Method -->
+                            <!-- Upload Method
                             <div id="upload-method" class="method-content">
                                 <form method="POST" enctype="multipart/form-data" id="uploadForm">
                                     <div class="file-upload-area" id="fileUploadArea">
@@ -331,7 +331,7 @@ if ($_POST && isset($_POST['qr_data'])) {
                                         <button type="submit" class="btn btn-success">Upload & Proses</button>
                                     </div>
                                 </form>
-                            </div>
+                            </div> -->
                             
                             <!-- Manual Method -->
                             <div id="manual-method" class="method-content">

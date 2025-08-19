@@ -340,7 +340,6 @@ if (isset($_GET['export']) && $_GET['export'] === 'csv') {
                                                 </td>
                                                 <td>
                                                     <strong>Hadir:</strong> <?php echo $session['hadir_count']; ?><br>
-                                                    <strong>Terlambat:</strong> <?php echo $session['terlambat_count']; ?><br>
                                                     <strong>Tidak Hadir:</strong> <?php echo $tidak_hadir; ?><br>
                                                     <small>Total: <?php echo $session['total_students']; ?> mahasiswa</small>
                                                 </td>
