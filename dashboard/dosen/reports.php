@@ -79,11 +79,7 @@ $query = "SELECT
             u.full_name as mahasiswa_name,
             u.nim_nip,
             COALESCE(a.status, 'alfa') as status,
-            a.scan_time,
-            COUNT(DISTINCT e.mahasiswa_id) OVER (PARTITION BY qs.id) as total_mahasiswa,
-            COUNT(DISTINCT CASE WHEN a.status = 'hadir' THEN a.mahasiswa_id END) OVER (PARTITION BY qs.id) as hadir_count,
-            COUNT(DISTINCT CASE WHEN a.status = 'sakit' THEN a.mahasiswa_id END) OVER (PARTITION BY qs.id) as sakit_count,
-            COUNT(DISTINCT CASE WHEN a.status = 'izin' THEN a.mahasiswa_id END) OVER (PARTITION BY qs.id) as izin_count
+            a.scan_time
           FROM qr_sessions qs
           JOIN kelas k ON qs.kelas_id = k.id
           JOIN mata_kuliah mk ON k.mata_kuliah_id = mk.id
@@ -101,10 +97,10 @@ $attendance_data = $stmt->fetchAll(PDO::FETCH_ASSOC);
 $summary_query = "SELECT 
                     COUNT(DISTINCT qs.id) as total_sessions,
                     COUNT(DISTINCT e.mahasiswa_id) as total_students,
-                    COUNT(DISTINCT CASE WHEN a.status = 'hadir' THEN a.id END) as total_hadir,
-                    COUNT(DISTINCT CASE WHEN a.status = 'sakit' THEN a.id END) as total_sakit,
-                    COUNT(DISTINCT CASE WHEN a.status = 'izin' THEN a.id END) as total_izin,
-                    COUNT(DISTINCT CASE WHEN a.id IS NULL THEN CONCAT(qs.id, '_', e.mahasiswa_id) END) as total_alfa
+                    COUNT(CASE WHEN a.status = 'hadir' THEN 1 END) as total_hadir,
+                    COUNT(CASE WHEN a.status = 'sakit' THEN 1 END) as total_sakit,
+                    COUNT(CASE WHEN a.status = 'izin' THEN 1 END) as total_izin,
+                    COUNT(CASE WHEN a.id IS NULL THEN 1 END) as total_alfa
                   FROM qr_sessions qs
                   JOIN kelas k ON qs.kelas_id = k.id
                   JOIN enrollments e ON k.id = e.kelas_id
@@ -122,153 +118,130 @@ $attendance_percentage = $total_possible > 0 ?
 
 // Handle PDF Export
 if (isset($_GET['export']) && $_GET['export'] === 'pdf') {
-    require_once '../../vendor/tcpdf/tcpdf.php';
+    // Simple HTML to PDF conversion
+    header('Content-Type: text/html');
+    header('Content-Disposition: inline; filename="Laporan_Kehadiran_' . date('Y-m-d') . '.html"');
     
-    $pdf = new TCPDF(PDF_PAGE_ORIENTATION, PDF_UNIT, PDF_PAGE_FORMAT, true, 'UTF-8', false);
-    
-    // Set document information
-    $pdf->SetCreator('QR Attendance System');
-    $pdf->SetAuthor($current_user['full_name']);
-    $pdf->SetTitle('Laporan Kehadiran - ' . date('d/m/Y'));
-    
-    // Set margins
-    $pdf->SetMargins(15, 27, 15);
-    $pdf->SetHeaderMargin(5);
-    $pdf->SetFooterMargin(10);
-    
-    // Set auto page breaks
-    $pdf->SetAutoPageBreak(TRUE, 25);
-    
-    // Add a page
-    $pdf->AddPage();
-    
-    // Set font
-    $pdf->SetFont('helvetica', 'B', 16);
-    
-    // Title
-    $pdf->Cell(0, 15, 'LAPORAN KEHADIRAN MAHASISWA', 0, 1, 'C');
-    $pdf->SetFont('helvetica', '', 12);
-    $pdf->Cell(0, 10, 'Politeknik Negeri Samarinda', 0, 1, 'C');
-    $pdf->Ln(10);
-    
-    // Report info
-    $pdf->SetFont('helvetica', 'B', 10);
-    $pdf->Cell(40, 8, 'Dosen:', 0, 0, 'L');
-    $pdf->SetFont('helvetica', '', 10);
-    $pdf->Cell(0, 8, $current_user['full_name'], 0, 1, 'L');
-    
-    $pdf->SetFont('helvetica', 'B', 10);
-    $pdf->Cell(40, 8, 'Periode:', 0, 0, 'L');
-    $pdf->SetFont('helvetica', '', 10);
-    $pdf->Cell(0, 8, date('F Y', strtotime($selected_month . '-01')), 0, 1, 'L');
-    
+    echo '<!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="UTF-8">
+        <title>Laporan Kehadiran</title>
+        <style>
+            @media print {
+                body { margin: 0; }
+                .no-print { display: none; }
+            }
+            body { font-family: Arial, sans-serif; font-size: 12px; margin: 20px; }
+            .header { text-align: center; margin-bottom: 30px; }
+            .info { margin-bottom: 20px; }
+            .stats { margin-bottom: 30px; }
+            .stats table { width: 100%; border-collapse: collapse; }
+            .stats th, .stats td { border: 1px solid #000; padding: 8px; text-align: center; }
+            .attendance-table { width: 100%; border-collapse: collapse; margin-top: 20px; }
+            .attendance-table th, .attendance-table td { border: 1px solid #000; padding: 6px; font-size: 10px; }
+            .session-header { background-color: #f0f0f0; font-weight: bold; }
+            .status-hadir { background-color: #d4edda; }
+            .status-sakit { background-color: #fff3cd; }
+            .status-izin { background-color: #d1ecf1; }
+            .status-alfa { background-color: #f8d7da; }
+        </style>
+    </head>
+    <body>
+        <div class="header">
+            <h2>LAPORAN KEHADIRAN MAHASISWA</h2>
+            <h3>Politeknik Negeri Samarinda</h3>
+        </div>
+        
+        <div class="info">
+            <strong>Dosen:</strong> ' . htmlspecialchars($current_user['full_name']) . '<br>
+            <strong>Periode:</strong> ' . date('F Y', strtotime($selected_month . '-01')) . '<br>';
+            
     if ($selected_class) {
         $class_info = array_filter($classes, function($c) use ($selected_class) {
             return $c['id'] == $selected_class;
         });
         if (!empty($class_info)) {
             $class = reset($class_info);
-            $pdf->SetFont('helvetica', 'B', 10);
-            $pdf->Cell(40, 8, 'Mata Kuliah:', 0, 0, 'L');
-            $pdf->SetFont('helvetica', '', 10);
-            $pdf->Cell(0, 8, $class['kode_mk'] . ' - ' . $class['nama_mk'] . ' (' . $class['nama_kelas'] . ')', 0, 1, 'L');
+            echo '<strong>Mata Kuliah:</strong> ' . htmlspecialchars($class['kode_mk'] . ' - ' . $class['nama_mk'] . ' (' . $class['nama_kelas'] . ')') . '<br>';
         }
     }
     
-    $pdf->Ln(5);
-    
-    // Summary statistics
-    $pdf->SetFont('helvetica', 'B', 12);
-    $pdf->Cell(0, 10, 'RINGKASAN STATISTIK', 0, 1, 'L');
-    
-    $pdf->SetFont('helvetica', '', 10);
-    $pdf->Cell(50, 8, 'Total Sesi:', 1, 0, 'L');
-    $pdf->Cell(30, 8, $summary['total_sessions'] ?? 0, 1, 0, 'C');
-    $pdf->Cell(50, 8, 'Total Mahasiswa:', 1, 0, 'L');
-    $pdf->Cell(30, 8, $summary['total_students'] ?? 0, 1, 1, 'C');
-    
-    $pdf->Cell(50, 8, 'Hadir:', 1, 0, 'L');
-    $pdf->Cell(30, 8, $summary['total_hadir'] ?? 0, 1, 0, 'C');
-    $pdf->Cell(50, 8, 'Sakit:', 1, 0, 'L');
-    $pdf->Cell(30, 8, $summary['total_sakit'] ?? 0, 1, 1, 'C');
-    
-    $pdf->Cell(50, 8, 'Izin:', 1, 0, 'L');
-    $pdf->Cell(30, 8, $summary['total_izin'] ?? 0, 1, 0, 'C');
-    $pdf->Cell(50, 8, 'Alfa:', 1, 0, 'L');
-    $pdf->Cell(30, 8, $summary['total_alfa'] ?? 0, 1, 1, 'C');
-    
-    $pdf->Cell(50, 8, 'Persentase Kehadiran:', 1, 0, 'L');
-    $pdf->Cell(30, 8, number_format($attendance_percentage, 1) . '%', 1, 0, 'C');
-    $pdf->Cell(80, 8, '', 0, 1, 'C');
-    
-    $pdf->Ln(10);
-    
-    // Attendance table
-    if (!empty($attendance_data)) {
-        $pdf->SetFont('helvetica', 'B', 12);
-        $pdf->Cell(0, 10, 'DETAIL KEHADIRAN', 0, 1, 'L');
+    echo '<strong>Tanggal Cetak:</strong> ' . date('d/m/Y H:i:s') . '
+        </div>
         
-        // Group by session
-        $sessions_grouped = [];
+        <div class="stats">
+            <h4>RINGKASAN STATISTIK</h4>
+            <table>
+                <tr>
+                    <th>Total Sesi</th>
+                    <th>Hadir</th>
+                    <th>Sakit</th>
+                    <th>Izin</th>
+                    <th>Alfa</th>
+                    <th>Persentase Kehadiran</th>
+                </tr>
+                <tr>
+                    <td>' . ($summary['total_sessions'] ?? 0) . '</td>
+                    <td>' . ($summary['total_hadir'] ?? 0) . '</td>
+                    <td>' . ($summary['total_sakit'] ?? 0) . '</td>
+                    <td>' . ($summary['total_izin'] ?? 0) . '</td>
+                    <td>' . ($summary['total_alfa'] ?? 0) . '</td>
+                    <td>' . number_format($attendance_percentage, 1) . '%</td>
+                </tr>
+            </table>
+        </div>';
+        
+    if (!empty($attendance_data)) {
+        echo '<h4>DETAIL KEHADIRAN</h4>
+        <table class="attendance-table">
+            <thead>
+                <tr>
+                    <th>No</th>
+                    <th>Tanggal</th>
+                    <th>Waktu</th>
+                    <th>Mata Kuliah</th>
+                    <th>Mahasiswa</th>
+                    <th>NIM</th>
+                    <th>Status</th>
+                    <th>Waktu Scan</th>
+                </tr>
+            </thead>
+            <tbody>';
+            
+        $no = 1;
+        $current_session = null;
         foreach ($attendance_data as $row) {
             $session_key = $row['session_id'] . '_' . $row['tanggal'];
-            if (!isset($sessions_grouped[$session_key])) {
-                $sessions_grouped[$session_key] = [
-                    'info' => $row,
-                    'students' => []
-                ];
+            if ($current_session !== $session_key) {
+                $current_session = $session_key;
+                echo '<tr class="session-header">
+                        <td colspan="8">
+                            <strong>Sesi: ' . date('d/m/Y', strtotime($row['tanggal'])) . ' - 
+                            ' . htmlspecialchars($row['kode_mk']) . ' (' . htmlspecialchars($row['nama_kelas']) . ')</strong>
+                        </td>
+                      </tr>';
             }
-            $sessions_grouped[$session_key]['students'][] = $row;
+            
+            echo '<tr class="status-' . $row['status'] . '">
+                    <td>' . $no++ . '</td>
+                    <td>' . date('d/m/Y', strtotime($row['tanggal'])) . '</td>
+                    <td>' . $row['jam_mulai'] . ' - ' . $row['jam_selesai'] . '</td>
+                    <td>' . htmlspecialchars($row['kode_mk'] . ' - ' . $row['nama_mk']) . '</td>
+                    <td>' . htmlspecialchars($row['mahasiswa_name']) . '</td>
+                    <td>' . htmlspecialchars($row['nim_nip']) . '</td>
+                    <td>' . ucfirst($row['status']) . '</td>
+                    <td>' . ($row['scan_time'] ? date('H:i:s', strtotime($row['scan_time'])) : '-') . '</td>
+                  </tr>';
         }
         
-        foreach ($sessions_grouped as $session_data) {
-            $session_info = $session_data['info'];
-            $students = $session_data['students'];
-            
-            // Session header
-            $pdf->SetFont('helvetica', 'B', 10);
-            $pdf->Cell(0, 8, 'Sesi: ' . date('d/m/Y', strtotime($session_info['tanggal'])) . ' - ' . 
-                       $session_info['kode_mk'] . ' (' . $session_info['nama_kelas'] . ')', 0, 1, 'L');
-            
-            // Table header
-            $pdf->SetFont('helvetica', 'B', 9);
-            $pdf->Cell(10, 8, 'No', 1, 0, 'C');
-            $pdf->Cell(50, 8, 'Nama Mahasiswa', 1, 0, 'C');
-            $pdf->Cell(25, 8, 'NIM', 1, 0, 'C');
-            $pdf->Cell(20, 8, 'Status', 1, 0, 'C');
-            $pdf->Cell(30, 8, 'Waktu Scan', 1, 1, 'C');
-            
-            // Table data
-            $pdf->SetFont('helvetica', '', 8);
-            $no = 1;
-            foreach ($students as $student) {
-                $pdf->Cell(10, 6, $no++, 1, 0, 'C');
-                $pdf->Cell(50, 6, $student['mahasiswa_name'], 1, 0, 'L');
-                $pdf->Cell(25, 6, $student['nim_nip'], 1, 0, 'C');
-                $pdf->Cell(20, 6, ucfirst($student['status']), 1, 0, 'C');
-                $pdf->Cell(30, 6, $student['scan_time'] ? date('H:i:s', strtotime($student['scan_time'])) : '-', 1, 1, 'C');
-            }
-            
-            // Session summary
-            $hadir = count(array_filter($students, function($s) { return $s['status'] === 'hadir'; }));
-            $sakit = count(array_filter($students, function($s) { return $s['status'] === 'sakit'; }));
-            $izin = count(array_filter($students, function($s) { return $s['status'] === 'izin'; }));
-            $alfa = count(array_filter($students, function($s) { return $s['status'] === 'alfa'; }));
-            $total = count($students);
-            $percentage = $total > 0 ? ($hadir / $total) * 100 : 0;
-            
-            $pdf->SetFont('helvetica', 'B', 9);
-            $pdf->Cell(85, 6, 'Total:', 1, 0, 'R');
-            $pdf->Cell(20, 6, 'H:' . $hadir . ' S:' . $sakit . ' I:' . $izin . ' A:' . $alfa, 1, 0, 'C');
-            $pdf->Cell(30, 6, number_format($percentage, 1) . '%', 1, 1, 'C');
-            
-            $pdf->Ln(5);
-        }
+        echo '</tbody>
+        </table>';
     }
     
-    // Output PDF
-    $filename = 'Laporan_Kehadiran_' . $current_user['full_name'] . '_' . date('Y-m-d') . '.pdf';
-    $pdf->Output($filename, 'D');
+    echo '<script>window.print();</script>
+    </body>
+    </html>';
     exit;
 }
 

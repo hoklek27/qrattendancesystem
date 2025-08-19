@@ -13,7 +13,7 @@ $current_user = getCurrentUser();
 $kelas_id = $_GET['kelas_id'] ?? '';
 
 if (empty($kelas_id)) {
-    echo json_encode(['success' => false, 'error' => 'Kelas ID required']);
+    echo json_encode(['success' => false, 'message' => 'Kelas ID tidak valid']);
     exit;
 }
 
@@ -24,21 +24,15 @@ try {
     $verify_stmt->execute([$kelas_id, $current_user['id']]);
     
     if ($verify_stmt->rowCount() === 0) {
-        echo json_encode(['success' => false, 'error' => 'Unauthorized access']);
+        echo json_encode(['success' => false, 'message' => 'Akses ditolak']);
         exit;
     }
     
-    // Get sessions for the class
-    $query = "SELECT 
-                id,
-                tanggal,
-                jam_mulai,
-                jam_selesai,
-                DATE_FORMAT(tanggal, '%d/%m/%Y') as formatted_date
-              FROM qr_sessions 
-              WHERE kelas_id = ? 
-              ORDER BY tanggal DESC, jam_mulai DESC";
-    
+    // Get sessions for this class
+    $query = "SELECT qs.*, DATE_FORMAT(qs.tanggal, '%d/%m/%Y') as formatted_date
+              FROM qr_sessions qs 
+              WHERE qs.kelas_id = ? 
+              ORDER BY qs.tanggal DESC, qs.jam_mulai DESC";
     $stmt = $db->prepare($query);
     $stmt->execute([$kelas_id]);
     $sessions = $stmt->fetchAll(PDO::FETCH_ASSOC);
@@ -49,9 +43,6 @@ try {
     ]);
     
 } catch (Exception $e) {
-    echo json_encode([
-        'success' => false,
-        'error' => 'Database error: ' . $e->getMessage()
-    ]);
+    echo json_encode(['success' => false, 'message' => 'Error: ' . $e->getMessage()]);
 }
 ?>
